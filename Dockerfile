@@ -43,6 +43,7 @@ RUN wget -qO /tmp/blender.tar.xz \
     mkdir -p /opt/blender && \
     tar -xf /tmp/blender.tar.xz -C /opt/blender --strip-components 1 && \
     rm /tmp/blender.tar.xz && \
+    ln -s /opt/blender/blender /usr/local/bin/blender && \
     /opt/blender/blender --version
 
 # Configure SSH for RunPod (key injected at runtime via PUBLIC_KEY env var)
