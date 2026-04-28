@@ -52,13 +52,13 @@ jobs:
           push: true
           build-args: |
             BLENDER_VERSION=${{ inputs.blender_version }}
-            BLENDER_MAJOR=${{ inputs.blender_major }}
+            BLENDER_MAJOR=${{ steps.version.outputs.major }}
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ inputs.blender_version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ inputs.blender_major }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ steps.version.outputs.major }}
 
       - name: Done
         run: |
           echo "Pushed:"
           echo "  ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ inputs.blender_version }}"
-          echo "  ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ inputs.blender_major }}"
+          echo "  ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ steps.version.outputs.major }}"
