@@ -1,8 +1,7 @@
 # Blender on RunPod - bare minimum image
 # Build with: docker build --build-arg BLENDER_VERSION=4.4.3 --build-arg BLENDER_MAJOR=4.4 -t <user>/blender-runpod:4.4.3 .
 
-ARG CUDA_VERSION=12.8.0
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
+FROM ubuntu:22.04
 
 # Blender version - override at build time for different versions
 ARG BLENDER_VERSION=4.4.3
@@ -12,6 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PATH="/opt/blender:${PATH}"
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 # System update + Blender runtime libs + SSH + minimal utilities
 # Libs match what your notebook installs, minus deprecated/unused ones.
