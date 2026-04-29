@@ -34,9 +34,12 @@ RUN apt-get update && apt-get upgrade -y && \
         libsm6 \
         libgl1 \
         libglu1-mesa \
+        libegl1 \
+        libgles2 \
         libfontconfig1 \
         libboost-all-dev \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Download and install Blender
 RUN wget -qO /tmp/blender.tar.xz \
