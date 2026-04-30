@@ -50,6 +50,25 @@ RUN wget -qO /tmp/blender.tar.xz \
     ln -s /opt/blender/blender /usr/local/bin/blender && \
     /opt/blender/blender --version
 
+
+
+# Live browser↔pod stream: cloudflared serves the WS up via a
+# *.trycloudflare.com URL; ws_server.py (shipped via manifest) uses the
+# `websockets` package to push render.log + GPU/CPU samples in real time.
+# Onstart's `command -v cloudflared` check skips the WS path if either
+# is missing, so older pods keep working — they just fall back to the
+# 5s Upstash poll.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-pip && \
+    pip3 install --no-cache-dir websockets && \
+    curl -fsSL -o /usr/local/bin/cloudflared \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && \
+    chmod +x /usr/local/bin/cloudflared && \
+    cloudflared --version && \
+    python3 -c "import websockets; print('websockets', websockets.__version__)" && \
+    rm -rf /var/lib/apt/lists/*
+
+
 # Configure SSH for RunPod (key injected at runtime via PUBLIC_KEY env var)
 RUN mkdir -p /var/run/sshd /root/.ssh && \
     chmod 700 /root/.ssh && \
