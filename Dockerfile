@@ -60,12 +60,13 @@ RUN wget -qO /tmp/blender.tar.xz \
 # 5s Upstash poll.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3-pip && \
-    pip3 install --no-cache-dir websockets && \
+    pip3 install --no-cache-dir websockets pillow && \
     curl -fsSL -o /usr/local/bin/cloudflared \
         https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && \
     chmod +x /usr/local/bin/cloudflared && \
     cloudflared --version && \
     python3 -c "import websockets; print('websockets', websockets.__version__)" && \
+    python3 -c "from PIL import Image; print('pillow', Image.__version__)" && \
     rm -rf /var/lib/apt/lists/*
 
 
