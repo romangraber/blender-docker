@@ -1,30 +1,58 @@
 # Blender on RunPod - bare minimum image
-# Build with: docker build --build-arg BLENDER_VERSION=4.4.3 --build-arg BLENDER_MAJOR=4.4 -t <user>/blender-runpod:4.4.3 .
+# Build with:
+#   docker build --build-arg BLENDER_VERSION=4.4.3 --build-arg BLENDER_MAJOR=4.4 \
+#                -t <user>/blender-runpod:4.4.3 .
 
 FROM ubuntu:22.04
 
-# Blender version - override at build time for different versions
-ARG BLENDER_VERSION=4.4.3
-ARG BLENDER_MAJOR=4.4
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH="/opt/blender:${PATH}" \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV PATH="/opt/blender:${PATH}"
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=all
 
-# System update + Blender runtime libs + SSH + minimal utilities
-# Libs match what your notebook installs, minus deprecated/unused ones.
-# rclone is included for pulling assets from R2/B2 at pod startup.
-RUN apt-get update && apt-get upgrade -y && \
+# ---------------------------------------------------------------------------
+# All apt work in a single layer.
+#
+# Two `apt-get update` calls are the minimum here and both are load-bearing:
+#   1. the base image ships an empty package index, so nothing installs
+#      without it;
+#   2. `add-apt-repository` only writes a sources.list entry + key - the
+#      PPA's index still has to be fetched before libstdc++6 resolves to
+#      the newer build.
+#
+# WHY THE PPA: some precompiled native Blender addons (e.g. SourceIO's
+# pylib.abi3.so) are built against GCC 13 and need GLIBCXX_3.4.31. Stock
+# Ubuntu 22.04 tops out at GLIBCXX_3.4.30, so enabling them fails with:
+#   ImportError: libstdc++.so.6: version `GLIBCXX_3.4.31' not found
+# libstdc++ is backward compatible, so Blender (built against the older
+# one) is unaffected - we only ADD symbols.
+#
+# `gnupg` is required and easy to miss: add-apt-repository imports the
+# PPA signing key by shelling out to gpg, and gpg cannot import into a
+# keyring without gpg-agent. software-properties-common does not pull it
+# in on its own, and --no-install-recommends stops anything else from
+# dragging it in, so the key import exits 2 and the build dies.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
     apt-get install -y --no-install-recommends \
+        software-properties-common \
+        gnupg; \
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test; \
+    apt-get update; \
+    apt-get upgrade -y; \
+    apt-get install -y --no-install-recommends \
+        libstdc++6 \
         wget \
         curl \
         xz-utils \
         ca-certificates \
         openssh-server \
         rclone \
+        python3-pip \
         libxi6 \
         libxxf86vm1 \
         libxfixes3 \
@@ -37,68 +65,71 @@ RUN apt-get update && apt-get upgrade -y && \
         libegl1 \
         libgles2 \
         libfontconfig1 \
-        libboost-all-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-
-# Newer libstdc++ (GCC 13 runtime) so precompiled native Blender addons
-# that ship their own compiled binaries can load. Some addons (e.g.
-# SourceIO's pylib.abi3.so) are built against GCC 13 and need
-# GLIBCXX_3.4.31, but stock Ubuntu 22.04 only provides up to
-# GLIBCXX_3.4.30, so enabling them fails with:
-#   ImportError: libstdc++.so.6: version `GLIBCXX_3.4.31' not found
-# The ubuntu-toolchain-r/test PPA carries the newer runtime. libstdc++
-# is backward compatible, so Blender (built against the older one) is
-# unaffected; we only ADD the newer symbols. The final grep is a
-# build-time assertion so a broken upgrade fails the build instead of
-# shipping an image that still can't load these addons.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends software-properties-common && \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libstdc++6 && \
-    strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 | grep -q GLIBCXX_3.4.31 && \
+        libboost-all-dev; \
+    \
+    # Build-time assertion: fail loudly here rather than ship an image
+    # that still can't load GCC 13 addons. grep -a reads the .so
+    # directly - `strings` would need binutils, which isn't installed.
+    grep -qa GLIBCXX_3.4.31 /usr/lib/x86_64-linux-gnu/libstdc++.so.6; \
+    \
+    # ws_server.py (shipped via manifest) streams render.log + GPU/CPU
+    # samples over the websocket.
+    pip3 install --no-cache-dir websockets pillow; \
+    python3 -c "import websockets; print('websockets', websockets.__version__)"; \
+    python3 -c "from PIL import Image; print('pillow', Image.__version__)"; \
+    \
+    # Only needed to add the PPA. The sources.list entry and key survive
+    # the purge, so apt still works inside a running container.
+    apt-get purge -y --auto-remove software-properties-common gnupg; \
     rm -rf /var/lib/apt/lists/*
 
 
-# Download and install Blender
-RUN wget -qO /tmp/blender.tar.xz \
-        "https://download.blender.org/release/Blender${BLENDER_MAJOR}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" && \
-    mkdir -p /opt/blender && \
-    tar -xf /tmp/blender.tar.xz -C /opt/blender --strip-components 1 && \
-    rm /tmp/blender.tar.xz && \
-    ln -s /opt/blender/blender /usr/local/bin/blender && \
+# ---------------------------------------------------------------------------
+# SSH for RunPod (key injected at runtime via the PUBLIC_KEY env var)
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    mkdir -p /var/run/sshd /root/.ssh; \
+    chmod 700 /root/.ssh; \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config; \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config; \
+    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+
+# ---------------------------------------------------------------------------
+# cloudflared - exposes the local websocket as a *.trycloudflare.com URL.
+# start.sh's `command -v cloudflared` check falls back to the 5s Upstash
+# poll when this is absent, so older pods keep working.
+#
+# Tracks latest. To pin, swap the URL for:
+#   https://github.com/cloudflare/cloudflared/releases/download/<tag>/cloudflared-linux-amd64
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    curl -fsSL -o /usr/local/bin/cloudflared \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64; \
+    chmod +x /usr/local/bin/cloudflared; \
+    cloudflared --version
+
+
+# ---------------------------------------------------------------------------
+# Blender. Last of the heavy layers and the only one keyed on the build
+# args, so a version bump re-downloads this and nothing above it.
+# ---------------------------------------------------------------------------
+ARG BLENDER_VERSION=4.4.3
+ARG BLENDER_MAJOR=4.4
+
+RUN set -eux; \
+    wget -qO /tmp/blender.tar.xz \
+        "https://download.blender.org/release/Blender${BLENDER_MAJOR}/blender-${BLENDER_VERSION}-linux-x64.tar.xz"; \
+    mkdir -p /opt/blender; \
+    tar -xf /tmp/blender.tar.xz -C /opt/blender --strip-components 1; \
+    rm /tmp/blender.tar.xz; \
+    ln -s /opt/blender/blender /usr/local/bin/blender; \
     /opt/blender/blender --version
 
 
-
-# Live browser↔pod stream: cloudflared serves the WS up via a
-# *.trycloudflare.com URL; ws_server.py (shipped via manifest) uses the
-# `websockets` package to push render.log + GPU/CPU samples in real time.
-# Onstart's `command -v cloudflared` check skips the WS path if either
-# is missing, so older pods keep working — they just fall back to the
-# 5s Upstash poll.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip && \
-    pip3 install --no-cache-dir websockets pillow && \
-    curl -fsSL -o /usr/local/bin/cloudflared \
-        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && \
-    chmod +x /usr/local/bin/cloudflared && \
-    cloudflared --version && \
-    python3 -c "import websockets; print('websockets', websockets.__version__)" && \
-    python3 -c "from PIL import Image; print('pillow', Image.__version__)" && \
-    rm -rf /var/lib/apt/lists/*
-
-
-# Configure SSH for RunPod (key injected at runtime via PUBLIC_KEY env var)
-RUN mkdir -p /var/run/sshd /root/.ssh && \
-    chmod 700 /root/.ssh && \
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config && \
-    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+# --chmod needs BuildKit/buildx (which you're already using). Under the
+# legacy builder, replace with a COPY + `RUN chmod +x /start.sh`.
+COPY --chmod=755 start.sh /start.sh
 
 WORKDIR /workspace
 EXPOSE 22
