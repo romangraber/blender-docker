@@ -41,6 +41,26 @@ RUN apt-get update && apt-get upgrade -y && \
     && rm -rf /var/lib/apt/lists/*
 
 
+# Newer libstdc++ (GCC 13 runtime) so precompiled native Blender addons
+# that ship their own compiled binaries can load. Some addons (e.g.
+# SourceIO's pylib.abi3.so) are built against GCC 13 and need
+# GLIBCXX_3.4.31, but stock Ubuntu 22.04 only provides up to
+# GLIBCXX_3.4.30, so enabling them fails with:
+#   ImportError: libstdc++.so.6: version `GLIBCXX_3.4.31' not found
+# The ubuntu-toolchain-r/test PPA carries the newer runtime. libstdc++
+# is backward compatible, so Blender (built against the older one) is
+# unaffected; we only ADD the newer symbols. The final grep is a
+# build-time assertion so a broken upgrade fails the build instead of
+# shipping an image that still can't load these addons.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends libstdc++6 && \
+    strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 | grep -q GLIBCXX_3.4.31 && \
+    rm -rf /var/lib/apt/lists/*
+
+
 # Download and install Blender
 RUN wget -qO /tmp/blender.tar.xz \
         "https://download.blender.org/release/Blender${BLENDER_MAJOR}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" && \
