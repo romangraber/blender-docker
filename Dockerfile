@@ -3,7 +3,7 @@
 #   docker build --build-arg BLENDER_VERSION=4.4.3 --build-arg BLENDER_MAJOR=4.4 \
 #                -t <user>/blender-runpod:4.4.3 .
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
