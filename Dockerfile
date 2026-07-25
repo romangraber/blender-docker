@@ -14,38 +14,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 
 # ---------------------------------------------------------------------------
-# All apt work in a single layer.
+# All apt work in a single layer, and on 24.04 a single `apt-get update`.
 #
-# Two `apt-get update` calls are the minimum here and both are load-bearing:
-#   1. the base image ships an empty package index, so nothing installs
-#      without it;
-#   2. `add-apt-repository` only writes a sources.list entry + key - the
-#      PPA's index still has to be fetched before libstdc++6 resolves to
-#      the newer build.
-#
-# WHY THE PPA: some precompiled native Blender addons (e.g. SourceIO's
-# pylib.abi3.so) are built against GCC 13 and need GLIBCXX_3.4.31. Stock
-# Ubuntu 22.04 tops out at GLIBCXX_3.4.30, so enabling them fails with:
+# NO PPA NEEDED HERE - this used to pull libstdc++6 from
+# ppa:ubuntu-toolchain-r/test. Background, since it's easy to
+# reintroduce by accident: some precompiled native Blender addons (e.g.
+# SourceIO's pylib.abi3.so) are built against GCC 13 and need
+# GLIBCXX_3.4.31. Ubuntu 22.04 topped out at GLIBCXX_3.4.30, so enabling
+# them failed with:
 #   ImportError: libstdc++.so.6: version `GLIBCXX_3.4.31' not found
-# libstdc++ is backward compatible, so Blender (built against the older
-# one) is unaffected - we only ADD symbols.
-#
-# `gnupg` is required and easy to miss: add-apt-repository imports the
-# PPA signing key by shelling out to gpg, and gpg cannot import into a
-# keyring without gpg-agent. software-properties-common does not pull it
-# in on its own, and --no-install-recommends stops anything else from
-# dragging it in, so the key import exits 2 and the build dies.
+# Noble ships the GCC 14 runtime (GLIBCXX_3.4.33), which already covers
+# it. Dropping the PPA also drops software-properties-common, gnupg and
+# the purge step that existed only to clean them up.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends \
-        software-properties-common \
-        gnupg; \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test; \
-    apt-get update; \
     apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
-        libstdc++6 \
         wget \
         curl \
         xz-utils \
@@ -67,32 +52,46 @@ RUN set -eux; \
         libfontconfig1 \
         libboost-all-dev; \
     \
-    # Build-time assertion: fail loudly here rather than ship an image
-    # that still can't load GCC 13 addons. grep -a reads the .so
-    # directly - `strings` would need binutils, which isn't installed.
+    # Build-time assertion, kept even though the PPA is gone: if a future
+    # base image regresses the C++ runtime, fail here instead of shipping
+    # an image that silently can't load GCC 13+ addons. grep -a reads the
+    # .so directly - `strings` would need binutils, which isn't installed.
     grep -qa GLIBCXX_3.4.31 /usr/lib/x86_64-linux-gnu/libstdc++.so.6; \
     \
     # ws_server.py (shipped via manifest) streams render.log + GPU/CPU
     # samples over the websocket.
-    pip3 install --no-cache-dir websockets pillow; \
+    #
+    # --break-system-packages is required on 24.04: Python 3.12 enforces
+    # PEP 668 and marks the system interpreter externally-managed, so pip
+    # refuses to touch it without an override. Safe here - nothing else
+    # in the image uses the system Python (Blender bundles its own), so
+    # there is no dependency resolver to conflict with.
+    pip3 install --no-cache-dir --break-system-packages websockets pillow; \
     python3 -c "import websockets; print('websockets', websockets.__version__)"; \
     python3 -c "from PIL import Image; print('pillow', Image.__version__)"; \
     \
-    # Only needed to add the PPA. The sources.list entry and key survive
-    # the purge, so apt still works inside a running container.
-    apt-get purge -y --auto-remove software-properties-common gnupg; \
     rm -rf /var/lib/apt/lists/*
 
 
 # ---------------------------------------------------------------------------
 # SSH for RunPod (key injected at runtime via the PUBLIC_KEY env var)
+#
+# Uses a drop-in rather than sed'ing sshd_config: `sed -i` exits 0 when
+# its pattern doesn't match, so an upstream comment reword would silently
+# leave root login disabled. sshd takes the FIRST value it sees for a
+# keyword and sshd_config Includes this directory from its very first
+# line, so these win over anything below. The grep asserts Include is
+# actually present.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
-    mkdir -p /var/run/sshd /root/.ssh; \
+    mkdir -p /var/run/sshd /root/.ssh /etc/ssh/sshd_config.d; \
     chmod 700 /root/.ssh; \
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config; \
-    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config; \
-    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+    grep -q 'Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config; \
+    printf '%s\n' \
+        'PermitRootLogin yes' \
+        'PasswordAuthentication no' \
+        'PubkeyAuthentication yes' \
+        > /etc/ssh/sshd_config.d/00-runpod.conf
 
 
 # ---------------------------------------------------------------------------
