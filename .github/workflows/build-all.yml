@@ -1,0 +1,205 @@
+name: Build All Blender Images
+
+# Rebuilds every Blender image whenever anything in this repo changes.
+#
+# Scoped to the default branch on purpose: the tags pushed here (`4.5`,
+# `latest`, ...) are the ones people pull, so building them from a feature
+# branch would overwrite published images with unreviewed content. Add your
+# branch under `branches:` if you want it to publish too.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      only_versions:
+        description: 'Space-separated versions to build instead of all (e.g. "4.5.12 5.2.0"). Leave empty for all.'
+        required: false
+        default: ''
+
+concurrency:
+  # A newer commit makes the in-flight 20-image run obsolete - don't pay for it.
+  group: build-all-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: blender-runpod
+  # Oldest version to publish. Everything on download.blender.org at or above
+  # this, patch releases included, gets an image.
+  MIN_VERSION: 4.4.3
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Ask download.blender.org what exists rather than hardcoding a list, so new
+  # patch releases (and whole new series) get picked up without touching this
+  # file. As of the last check that's 20 images: 4.4.3, 4.5.0-4.5.12,
+  # 5.0.0-5.0.1, 5.1.0-5.1.2, 5.2.0.
+  # ---------------------------------------------------------------------------
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: List Blender versions
+        id: list
+        env:
+          ONLY_VERSIONS: ${{ inputs.only_versions }}
+        run: |
+          set -euo pipefail
+          BASE="https://download.blender.org/release"
+
+          # ge A B -> true when A >= B. `sort -V` is version-aware, so this
+          # gets 4.5.10 > 4.5.9 right where a string compare would not.
+          ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
+
+          if [ -n "$ONLY_VERSIONS" ]; then
+            versions=$(printf '%s\n' $ONLY_VERSIONS | sort -u -V)
+            echo "Manual override, building only: $(echo $versions)"
+          else
+            # Series directories are named Blender4.5, Blender5.0, ...
+            series=$(curl -fsSL "$BASE/" \
+              | grep -oE 'Blender[0-9]+\.[0-9]+/' \
+              | sed -E 's|Blender||; s|/||' \
+              | sort -u -V)
+
+            versions=""
+            for s in $series; do
+              ge "$s" "${MIN_VERSION%.*}" || continue
+              # The index lists each file twice (href + link text) and the
+              # .sha256 siblings match too - sort -u collapses all of that.
+              found=$(curl -fsSL "$BASE/Blender$s/" \
+                | grep -oE 'blender-[0-9]+\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' \
+                | sed -E 's|blender-(.+)-linux-x64\.tar\.xz|\1|' \
+                | sort -u -V)
+              for v in $found; do
+                ge "$v" "$MIN_VERSION" && versions="$versions $v"
+              done
+            done
+            versions=$(printf '%s\n' $versions | sort -u -V)
+          fi
+
+          [ -n "$versions" ] || { echo "::error::discovered no Blender versions"; exit 1; }
+
+          newest=$(printf '%s\n' "$versions" | tail -n1)
+
+          # Ascending order means the last write per series wins, i.e. the
+          # highest patch. Only that build may claim the series alias - if all
+          # 13 of the 4.5.x jobs pushed `:4.5`, whichever finished last would
+          # decide what `:4.5` means.
+          declare -A newest_of_series
+          for v in $versions; do newest_of_series[${v%.*}]="$v"; done
+
+          matrix="["
+          sep=""
+          for v in $versions; do
+            s="${v%.*}"
+            tags="$v"
+            [ "${newest_of_series[$s]}" = "$v" ] && tags="$tags $s"
+            write_cache="no"
+            if [ "$v" = "$newest" ]; then tags="$tags latest"; write_cache="yes"; fi
+            matrix="$matrix$sep{\"version\":\"$v\",\"series\":\"$s\",\"tags\":\"$tags\",\"write_cache\":\"$write_cache\"}"
+            sep=","
+          done
+          matrix="$matrix]"
+
+          count=$(printf '%s\n' $versions | wc -l)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          echo "### Building $count images" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo $versions >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      # One bad version (pulled release, bad tarball) shouldn't cancel the
+      # other 19.
+      fail-fast: false
+      # Free accounts cap out at 20 concurrent jobs across the whole account;
+      # leave room for everything else you run.
+      max-parallel: 8
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    name: ${{ matrix.version }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Free up disk space
+        # GitHub runners only have ~14GB free by default, and the Blender
+        # tarball plus the base layers and the layer cache can run tight.
+        # Frees ~25GB.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose tags
+        id: meta
+        env:
+          # Via env, not direct ${{ }} interpolation into the script - the
+          # matrix values come off a scraped web page.
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAGS: ${{ matrix.tags }}
+          WRITE_CACHE: ${{ matrix.write_cache }}
+        run: |
+          set -euo pipefail
+          IMAGE="$DOCKERHUB_USERNAME/$IMAGE_NAME"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            for t in $TAGS; do echo "$IMAGE:$t"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Everything above the BLENDER_VERSION arg in the Dockerfile (apt,
+          # sshd, cloudflared) is identical across all 20 builds, so one job
+          # publishes a layer cache and the rest read it. Writing it from every
+          # job would just have them clobber each other's.
+          if [ "$WRITE_CACHE" = "yes" ]; then
+            echo "cache_to=type=registry,ref=$IMAGE:buildcache,mode=max" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache_to=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          # Keeps Docker Hub's tag view free of the "unknown/unknown" entry
+          # that attestation manifests show up as.
+          provenance: false
+          build-args: |
+            BLENDER_VERSION=${{ matrix.version }}
+            BLENDER_MAJOR=${{ matrix.series }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # Warns and carries on when the cache tag doesn't exist yet.
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to: ${{ steps.meta.outputs.cache_to }}
+
+      - name: Summary
+        env:
+          PUSHED: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
+          while read -r t; do
+            [ -n "$t" ] && echo "- \`$t\`" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$PUSHED"
